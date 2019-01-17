@@ -11,6 +11,8 @@
 {-# LANGUAGE StandaloneDeriving  #-}
 module UnliftIO.Internals.Async where
 
+import Debug.Trace
+
 import           Control.Applicative
 import           Control.Concurrent       (threadDelay, getNumCapabilities)
 import qualified Control.Concurrent       as C
@@ -33,7 +35,6 @@ import qualified Control.Exception        as E
 import           GHC.Generics             (Generic)
 
 #if MIN_VERSION_base(4,9,0)
-import           Data.Semigroup
 #else
 import           Data.Monoid              hiding (Alt)
 #endif
@@ -607,7 +608,6 @@ instance NFData (FlatApp a) where
       FlatApply !cf !ca -> rnf cf `seq` rnf ca `seq` ()
       FlatLiftA2 !_f !cx !cy -> rnf cx `seq` rnf cy `seq` ()
 
-
 deriving instance Functor FlatApp
 instance Applicative FlatApp where
   pure = FlatPure
@@ -730,81 +730,124 @@ unzipTuple ts0 =
           in Tuple (dlistCons a as) (dlistCons b bs)
 
 -- | Evaluates a `Flat` tree, it forks a thread per 'FlatAction' and builds a
--- Tuple with an IO sub-routine that returns a composed result, and a DList of
--- with all the 'ThreadId' from forked 'FlatAction'.
+-- Tuple with an IO sub-routine that returns a composed result, and a DList with
+-- all the 'ThreadId' from forked 'FlatAction'.
 --
--- This the evaluator we use by default on 'runConc', when the algorithm encounters a
--- 'FlatAlt' in the 'Flat' tree, it will switch to 'evalFlatInSTM'.
+-- This is the evaluator we use for all cases but `Alternative` values on
+-- 'runConc', when the algorithm encounters a 'FlatAlt' in the 'Flat' tree, it
+-- will switch to 'evalFlatInSTM'. This is done for performance reasons.
+--
+-- TODO: Explain exactly what getting values from Alternative entails (read
+-- blocking MVars and requiring a new thread to do so, defeating the purpose of
+-- this exercise)
 --
 evalFlatInIO :: forall a.
-     MVar E.SomeException
+     (forall k. IO k -> IO k)
+  -> MVar (Either E.SomeException a)
   -> TVar Int
   -> Flat a
-  -> IO (Tuple (IO a) (DList C.ThreadId))
-evalFlatInIO excVar resultCountVar val =
+  -> IO (Tuple (IO (Either SomeException a)) (DList C.ThreadId))
+evalFlatInIO unmask resultVar resultCountVar val =
   case val of
-    FlatApp (FlatPure !x) -> {-# SCC evalFlatInIO_Pure #-} pure (Tuple (pure x) dlistEmpty)
+    FlatApp (FlatPure !a) -> {-# SCC evalFlatInIO_Pure #-} do
+      -- putStrLn "evalFlatInIO_Pure: BEFORE put value pure"
+      unmask $ putMVar resultVar (Right a)
+      -- putStrLn "evalFlatInIO_Pure: AFTER put value pure"
+      pure (Tuple (pure (Right a)) dlistEmpty)
     FlatApp (FlatAction !action) -> {-# SCC evalFlatInIO_Action #-} do
-      resultVar <- newEmptyMVar
       actionTid <- C.forkIOWithUnmask $ \restore -> do
         eresult <- E.try (restore action)
-        E.finally (case eresult of
-                     Left err -> void $ tryPutMVar excVar err
-                     Right result -> putMVar resultVar result)
-                  (atomically $ modifyTVar' resultCountVar (+1))
-      pure $ Tuple (takeMVar resultVar) (dlistSingleton actionTid)
+        atomically $ modifyTVar' resultCountVar (+1)
+        restore $ case eresult of
+          Left err -> do
+            -- putStrLn "evalFlatInIO_Action: BEFORE put left"
+            putMVar resultVar (Left err)
+            -- putStrLn "evalFlatInIO_Action: AFTER put left"
+          Right result -> do
+            -- putStrLn "evalFlatInIO_Action: BEFORE put right"
+            putMVar resultVar (Right result)
+            -- putStrLn "evalFlatInIO_Action: AFTER put right"
+      let evalAction = do
+            -- putStrLn "evalFlatInIO_Action: Calling evalAction"
+            readMVar resultVar
+      pure $ Tuple evalAction (dlistSingleton actionTid)
 
-    FlatApp (FlatThen !fa fb) -> {-# SCC evalFlatInIO_Then #-} do
-      (Tuple ioA tidA) <- evalFlatInIO excVar resultCountVar fa
-      (Tuple ioB tidB) <- evalFlatInIO excVar resultCountVar fb
-      pure (Tuple (ioA *> ioB) (tidA `dlistConcat` tidB))
+    FlatApp (FlatThen !fa !fb) -> {-# SCC evalFlatInIO_Then #-} do
+      aVar <- newEmptyMVar
+      Tuple ioA tidA <- evalFlatInIO unmask aVar resultCountVar fa
+      Tuple ioB tidB <- evalFlatInIO unmask resultVar resultCountVar fb
+      let evalAction = do
+            ea <- ioA
+            case ea of
+              Left err -> pure (Left err)
+              _ -> ioB
+      pure $ Tuple evalAction (tidA `dlistConcat` tidB)
 
     FlatApp (FlatApply !ff !fa) -> {-# SCC evalFlatInIO_Apply #-} do
-      (Tuple ioF tidF) <- evalFlatInIO excVar resultCountVar ff
-      (Tuple ioA tidA) <- evalFlatInIO excVar resultCountVar fa
-      pure (Tuple (ioF <*> ioA) (tidF `dlistConcat` tidA))
+      fVar <- newEmptyMVar
+      aVar <- newEmptyMVar
+      Tuple ioF tidF <- evalFlatInIO unmask fVar resultCountVar ff
+      Tuple ioA tidA <- evalFlatInIO unmask aVar resultCountVar fa
+      -- putStrLn "evalFlatInIO_Apply: After calling evalFlatInIO"
+      let evalAction = do
+            -- putStrLn "evalFlatInIO_Apply: BEFORE ioF"
+            f <- ioF
+            -- putStrLn "evalFlatInIO_Apply: BEFORE ioA"
+            a <- ioA
+            -- putStrLn "evalFlatInIO_Apply: AFTER ioF & ioA"
+            let !result = f <*> a
+            -- putStrLn "evalFlatInIO_Apply: BEFORE putMVar"
+            putMVar resultVar result
+            -- putStrLn "evalFlatInIO_Apply: AFTER putMVar"
+            pure result
+      pure (Tuple evalAction (tidF `dlistConcat` tidA))
 
     FlatApp (FlatLiftA2 !f !fa !fb) -> {-# SCC evalFlatInIO_LiftA2 #-} do
-      (Tuple ioA tidA) <- evalFlatInIO excVar resultCountVar fa
-      (Tuple ioB tidB) <- evalFlatInIO excVar resultCountVar fb
-      pure (Tuple (liftA2 f ioA ioB) (tidA `dlistConcat` tidB))
+      aVar <- newEmptyMVar
+      bVar <- newEmptyMVar
+      Tuple ioA tidA <- evalFlatInIO unmask aVar resultCountVar fa
+      Tuple ioB tidB <- evalFlatInIO unmask bVar resultCountVar fb
+      let evalAction = do
+            a <- ioA
+            b <- ioB
+            let !result = liftA2 f a b
+            putMVar resultVar result
+            pure result
+      pure (Tuple evalAction (tidA `dlistConcat` tidB))
 
-    FlatAlt {} -> {-# SCC evalFlatInIO_Alt #-} do
-      resultVar <- newEmptyMVar
-      subExcVar <- newEmptyTMVarIO
-      -- Automatically retry if we get killed by a
-      -- BlockedIndefinitelyOnSTM. For more information, see:
-      --
-      -- + https:\/\/github.com\/simonmar\/async\/issues\/14
-      -- + https:\/\/github.com\/simonmar\/async\/pull\/15
-      --
-      let autoRetry action =
-            action `E.catch`
-            \E.BlockedIndefinitelyOnSTM -> autoRetry action
-
-      Tuple blocker tidVal <- evalFlatInSTM subExcVar resultCountVar val
-
-      let getResult = do
-            eresult <-
-              autoRetry $
-              atomically $
-              (Right <$> blocker) <|> (Left <$> takeTMVar subExcVar)
-
-            case eresult of
-              Left err -> void $ tryPutMVar excVar err
-              Right result -> putMVar resultVar result
-
-      pure (Tuple (getResult *> takeMVar resultVar) tidVal)
+    FlatAlt concA concB concRest -> {-# SCC evalFlatInIO_Alt #-} do
+      let concList :: [FlatApp a]
+          concList = concA : concB : concRest
+      altResultVar <- newEmptyMVar
+      Tuple ioActions threadIds0 <- unzipTuple <$> traverse (evalFlatInIO unmask altResultVar resultCountVar . FlatApp) concList
+      let
+        threadIds = dlistConcatAll threadIds0
+        evalAction = do
+          -- putStrLn "evalFlatInIO_Alt: before eval ioActions"
+          for_ ioActions $ \action -> do
+            void action
+            -- putStrLn "evalFlatInIO_Alt: evaluation IO statement"
+          -- putStrLn "evalFlatInIO_Alt: after eval ioActions"
+          -- putStrLn "evalFlatInIO_Alt: before read altResultVar"
+          !result <- unmask $ readMVar altResultVar
+          -- putStrLn "evalFlatInIO_Alt: after read altResultVar"
+          mapM_ C.killThread (dlistToList threadIds)
+          -- putStrLn "evalFlatInIO_Alt: before kill all threads"
+          unmask $ putMVar resultVar result
+          -- putStrLn "evalFlatInIO_Alt: after kill all threads"
+          pure result
+      pure (Tuple evalAction threadIds)
 
 
 -- | Evaluates a `Flat` tree, it forks a thread per 'FlatAction' and builds a
--- Tuple with an STM transaction that returns a composed result, and a DList of
+-- Tuple with an STM transaction that returns a composed result, and a DList
 -- with all the 'ThreadId' from forked 'FlatAction'.
 --
 -- This approach is used when we compose `Conc` values using the `Alternative`
--- functions. We don't use this evaluation strategy by default given the
--- performance overhead of STM is considerable when composing a large amount of
--- read operations.
+-- functions. We don't use this evaluation strategy on non `Alternative` cases
+-- given the performance overhead of STM is considerable when composing a large
+-- amount of read operations.
+--
 evalFlatInSTM :: forall a.
             TMVar E.SomeException
          -> TVar Int
@@ -893,8 +936,9 @@ runFlat (FlatApp (FlatPure x)) = pure x
 
 -- Start off with all exceptions masked so we can install proper cleanup.
 runFlat f0 = E.uninterruptibleMask $ \restore -> do
-  -- How many threads have been spawned and finished their task? We need to
-  -- ensure we kill all child threads and wait for them to die.
+  -- How many threads have been spawned and terminated their given IO action? We
+  -- need to ensure we kill all child threads that haven't finished and wait for
+  -- them to die after threadKill.
   resultCountVar <- newTVarIO 0
 
   -- Forks off as many threads as necessary to run the given Flat a,
@@ -914,12 +958,13 @@ runFlat f0 = E.uninterruptibleMask $ \restore -> do
   -- SomeException when things fail.
   --
   -- TODO: Investigate why performance degradation on Either
-  excVar <- newEmptyMVar
-  (Tuple getRes tids0) <- {-# SCC go_Call #-} evalFlatInIO excVar resultCountVar f0
+  resultVar <- newEmptyMVar
+  (Tuple getRes tids0) <- {-# SCC go_Call #-} evalFlatInIO restore resultVar resultCountVar f0
 
   let tids = dlistToList tids0
       tidCount = length tids
       allDone count =
+        -- traceShow ("=>", count, tidCount) $
         if count > tidCount
           then error ("allDone: count ("
                       <> show count
@@ -930,27 +975,39 @@ runFlat f0 = E.uninterruptibleMask $ \restore -> do
 
   -- Restore the original masking state while blocking and catch
   -- exceptions to allow the parent thread to be killed early.
-  res <- E.try $ restore $ race (readMVar excVar) getRes
+  -- putStrLn "runFlat: before getRes"
+  res <- E.try $ restore getRes
+  -- putStrLn "runFlat: after getRes"
 
   count0 <- atomically $ readTVar resultCountVar
+  -- putStrLn $ "runFlat: getting thread count: " <> show count0
   unless (allDone count0) $ do
     -- Kill all of the threads
     -- NOTE: Replacing A.AsyncCancelled with KillThread as the
     -- 'A.AsyncCancelled' constructor is not exported in older versions
     -- of the async package
     -- for_ tids $ \tid -> E.throwTo tid A.AsyncCancelled
-    for_ tids $ \tid -> C.killThread tid
+    -- putStrLn $ "runFlat: before killing all threads"
+    for_ tids $ \tid -> do
+      -- putStrLn $ "runFlat: killing thread id "  <> show tid
+      C.throwTo tid E.ThreadKilled
+      -- C.killThread tid
+      -- putStrLn $ "runFlat: killed thread id "  <> show tid
+    -- putStrLn $ "runFlat: after killing all threads"
+
 
     -- Wait for all of the threads to die. We're going to restore the original
     -- masking state here, just in case there's a bug in the cleanup code of a
     -- child thread, so that we can be killed by an async exception. We decided
     -- this is a better behavior than hanging indefinitely and wait for a SIGKILL.
 
+    -- putStrLn $ "DEBUG: before waiting for allDone"
     {-# SCC runFlat_waitAllDone #-} restore $ atomically $ do
       count <- readTVar resultCountVar
+      -- traceM $ ">>> DEBUG Count is: " <> show count
       -- retries until resultCountVar has increased to the threadId count returned by go
       check $ allDone count
-
+    -- putStrLn $ "DEBUG: after waiting for allDone"
 
   -- Return the result or throw an exception. Yes, we could use
   -- either or join, but explicit pattern matching is nicer here.

@@ -2,6 +2,9 @@
 {-# LANGUAGE CPP #-}
 module UnliftIO.AsyncSpec (spec) where
 
+import Debug.Trace
+
+import Data.List (foldl')
 import Test.Hspec
 import Test.Hspec.QuickCheck
 import Test.QuickCheck
@@ -108,7 +111,8 @@ spec = do
       -- Using this conc (pure ()) to make sure we are exercising the
       -- conc branch where forkIOWithUnmask is used, this is an implementation
       -- detail.
-      runConc $ conc (pure ()) *> conc (getMaskingState `shouldReturn` Unmasked)
+      maskedState <- runConc $ conc (pure ()) *> conc getMaskingState
+      maskedState `shouldBe` Unmasked
 
 -- NOTE: Older versions of GHC have a timeout function that doesn't
 -- work on Windows
@@ -150,8 +154,9 @@ spec = do
           killer = conc $ atomically $ do
             count' <- readTVar var
             checkSTM $ count == count'
+            -- traceM "test:killer: throwing exception"
             throwSTM MyExc
-          composed = foldr (*>) killer (replicate count worker)
+          composed = foldl' (*>) killer (replicate count worker)
       runConc composed `shouldThrow` (== MyExc)
       atomically (readTVar var) `shouldReturn` 0
 
@@ -199,6 +204,8 @@ spec = do
                  atomicModifyIORef' ref (\acc -> (tid:acc, ()))
                  -- it is never going to finish
                  threadDelay maxBound)
+      -- give the runtime some leeway
+      threadDelay 500
       threads <- readIORef ref
       statusList <- mapM threadStatus threads
       length (filter (== ThreadFinished) statusList) `shouldBe` 3
@@ -206,10 +213,14 @@ spec = do
     it "nesting works" $ do
       var <- newEmptyMVar
       let sillyAlts :: Conc IO a -> Conc IO a
-          sillyAlts c = c <|> conc (takeMVar var >> error "shouldn't happen")
-      res <- runConc $ sillyAlts $ (+)
-        <$> sillyAlts (conc (pure 1))
-        <*> sillyAlts (conc (pure 2))
+          sillyAlts c =
+              c <|>
+              conc (do -- putStrLn "sillyAlts: conc action: before takeMVar"
+                       takeMVar var
+                       -- putStrLn "sillyAlts: conc action: after takeMVar"
+                       error "shouldn't happen")
+      res <- runConc $ sillyAlts ((+) <$> sillyAlts (conc (pure 1))
+                                      <*> sillyAlts (conc (pure 2)))
       res `shouldBe` 3
       putMVar var ()
 
