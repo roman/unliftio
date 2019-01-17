@@ -563,6 +563,13 @@ data Flat a
   -- FlatApp (no nesting of FlatAlts).
   | FlatAlt !(FlatApp a) !(FlatApp a) ![FlatApp a]
 
+instance Show (Flat a) where
+  show val =
+    case val of
+      FlatApp app -> show app
+      FlatAlt app1 app2 apps -> do
+        "FlatAlt " <> show ([app1, app2] ++ apps)
+
 instance NFData (Flat a) where
   rnf val =
     case val of
@@ -598,6 +605,15 @@ data FlatApp a where
   FlatApply  :: Flat (v -> a) -> Flat v -> FlatApp a
   FlatThen   :: Flat x -> Flat a -> FlatApp a
   FlatLiftA2 :: (x -> y -> a) -> Flat x -> Flat y -> FlatApp a
+
+instance Show (FlatApp a) where
+  show val =
+    case val of
+      FlatPure {} -> "FlatPure"
+      FlatAction {} -> "FlatAction"
+      FlatApply {} -> "FlatApply"
+      FlatThen {} -> "FlatThen"
+      FlatLiftA2 {} -> "FlatLiftA2"
 
 instance NFData (FlatApp a) where
   rnf val =
@@ -661,13 +677,13 @@ dlistEmpty = id
 -- 'empty', this may fail, e.g. @flatten Empty@.
 --
 -- @since 0.2.9.0
-flatten :: forall m a. MonadUnliftIO m => Conc m a -> m (Flat a)
-flatten c0 = withRunInIO $ \run -> do
+flatten :: forall m a. MonadUnliftIO m => Conc m a -> Either ConcException (Flat (m a))
+flatten c0 = -- withRunInIO $ \run -> do
 
   -- why not app?
-  let both :: forall k. Conc m k -> IO (Flat k)
-      both Empty = E.throwIO EmptyWithNoAlternative
-      both (Action m) = pure $ FlatApp $ FlatAction $ run m
+  let both :: forall k. Conc m k -> Either ConcException (Flat (m k))
+      both Empty = Left EmptyWithNoAlternative
+      both (Action m) = Right $ FlatApp $ FlatAction (withRunInIO $ \run -> run m)
       both (Apply cf ca) = do
         !f <- both cf
         !a <- both ca
@@ -684,13 +700,13 @@ flatten c0 = withRunInIO $ \run -> do
         !a <- alt ca
         !b <- alt cb
         case dlistToList (a `dlistConcat` b) of
-          []    -> E.throwIO EmptyWithNoAlternative
+          []    -> Left EmptyWithNoAlternative
           [!x]   -> pure $ FlatApp x
           x:y:z -> x `seq` y `seq` z `seq` pure $ FlatAlt x y z
-      both (Pure a) = pure $ FlatApp $ FlatPure a
+      both (Pure a) = Right $ FlatApp $ FlatPure (pure a)
 
       -- Returns a difference list for cheaper concatenation
-      alt :: forall k. Conc m k -> IO (DList (FlatApp k))
+      alt :: forall k. Conc m k -> Either ConcException (DList (FlatApp k))
       alt Empty = pure dlistEmpty
       alt (Apply cf ca) = do
         !f <- both cf
@@ -704,14 +720,14 @@ flatten c0 = withRunInIO $ \run -> do
         !a <- alt ca
         !b <- alt cb
         pure $ a `dlistConcat` b
-      alt (Action m) = pure (dlistSingleton $ FlatAction (run m))
+      alt (Action m) = pure (dlistSingleton $ FlatAction m)
       alt (LiftA2 f ca cb) = do
         !a <- both ca
         !b <- both cb
         pure (dlistSingleton $ FlatLiftA2 f a b)
-      alt (Pure a) = pure (dlistSingleton $ FlatPure a)
+      alt (Pure a) = pure (dlistSingleton $ FlatPure (pure a))
 
-  both c0
+  in both c0
 
 -- | Strict version of Tuple
 data Tuple a b = Tuple !a !b
