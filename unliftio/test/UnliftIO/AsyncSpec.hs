@@ -215,9 +215,7 @@ spec = do
       let sillyAlts :: Conc IO a -> Conc IO a
           sillyAlts c =
               c <|>
-              conc (do -- putStrLn "sillyAlts: conc action: before takeMVar"
-                       takeMVar var
-                       -- putStrLn "sillyAlts: conc action: after takeMVar"
+              conc (do takeMVar var
                        error "shouldn't happen")
       res <- runConc $ sillyAlts ((+) <$> sillyAlts (conc (pure 1))
                                       <*> sillyAlts (conc (pure 2)))
@@ -225,3 +223,16 @@ spec = do
       putMVar var ()
 
 #endif
+
+-- nestingWorksSpec =
+--   it "nesting works" $ do
+--     var <- newEmptyMVar
+--     let sillyAlts :: Conc IO a -> Conc IO a
+--         sillyAlts c =
+--             c <|>
+--             conc (do takeMVar var
+--                      error "shouldn't happen")
+--     res <- runConc $ sillyAlts ((+) <$> sillyAlts (conc (pure 1))
+--                                     <*> sillyAlts (conc (pure 2)))
+--     res `shouldBe` 3
+--     putMVar var ()
