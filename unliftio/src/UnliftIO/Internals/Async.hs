@@ -49,6 +49,9 @@ debugThread body = do
   tid <- C.myThreadId
   putStrLn $ "[" <> show tid <> "] " <> body
 
+-- debugThread :: String -> IO ()
+-- debugThread _ = return ()
+
 -- | Unlifted 'A.async'.
 --
 -- @since 0.1.0.0
@@ -782,9 +785,9 @@ evalFlatInIO unmask resultVar resultCountVar val =
       pure (Tuple (pure (Right a)) dlistEmpty)
     FlatApp (FlatAction !action) -> {-# SCC evalFlatInIO_Action #-} do
       actionTid <- C.forkIOWithUnmask $ \restore -> do
-        debugThread "evalFlatInIO_Action: Before Action"
+        debugThread "evalFlatInIO_Action: BEFORE Action"
         eresult <- E.try (restore action)
-        debugThread "evalFlatInIO_Action: After Action"
+        debugThread "evalFlatInIO_Action: AFTER Action"
         atomically $ modifyTVar' resultCountVar (+1)
         restore $ case eresult of
           Left err -> do
@@ -796,7 +799,7 @@ evalFlatInIO unmask resultVar resultCountVar val =
             putMVar resultVar (Right result)
             debugThread "evalFlatInIO_Action: AFTER put right"
       let evalAction = do
-            debugThread "evalFlatInIO_Action: Calling evalAction"
+            debugThread "evalFlatInIO_Action: CALL evalAction"
             readMVar resultVar
       pure $ Tuple evalAction (dlistSingleton actionTid)
 
@@ -814,19 +817,24 @@ evalFlatInIO unmask resultVar resultCountVar val =
     FlatApp (FlatApply !ff !fa) -> {-# SCC evalFlatInIO_Apply #-} do
       fVar <- newEmptyMVar
       aVar <- newEmptyMVar
+      debugThread "evalFlatInIO_Apply: BEFORE calling evalFlatInIO in 'f'"
       Tuple ioF tidF <- evalFlatInIO unmask fVar resultCountVar ff
+      debugThread "evalFlatInIO_Apply: AFTER calling evalFlatInIO in 'f'"
+      debugThread "evalFlatInIO_Apply: BEFORE calling evalFlatInIO in 'a'"
       Tuple ioA tidA <- evalFlatInIO unmask aVar resultCountVar fa
-      debugThread "evalFlatInIO_Apply: After calling evalFlatInIO"
+      debugThread "evalFlatInIO_Apply: AFTER calling evalFlatInIO in 'a'"
       let evalAction = do
-            debugThread "evalFlatInIO_Apply: BEFORE ioF"
+            debugThread "evalFlatInIO_Apply: CALL evalAction"
+            debugThread "evalFlatInIO_Apply: BEFORE ioF evalAction"
             f <- ioF
-            debugThread "evalFlatInIO_Apply: BEFORE ioA"
+            debugThread "evalFlatInIO_Apply: AFTER ioF evalAction"
+            debugThread "evalFlatInIO_Apply: BEFORE ioA evalAction"
             a <- ioA
-            debugThread "evalFlatInIO_Apply: AFTER ioF & ioA"
+            debugThread "evalFlatInIO_Apply: AFTER ioA evalAction"
             let !result = f <*> a
-            debugThread "evalFlatInIO_Apply: BEFORE putMVar"
+            debugThread "evalFlatInIO_Apply: BEFORE putMVar result"
             putMVar resultVar result
-            debugThread "evalFlatInIO_Apply: AFTER putMVar"
+            debugThread "evalFlatInIO_Apply: AFTER putMVar result"
             pure result
       pure (Tuple evalAction (tidF `dlistConcat` tidA))
 
@@ -839,7 +847,7 @@ evalFlatInIO unmask resultVar resultCountVar val =
             a <- ioA
             b <- ioB
             let !result = liftA2 f a b
-            putMVar resultVar result
+            -- putMVar resultVar result
             pure result
       pure (Tuple evalAction (tidA `dlistConcat` tidB))
 
@@ -847,23 +855,30 @@ evalFlatInIO unmask resultVar resultCountVar val =
       let concList :: [FlatApp a]
           concList = concA : concB : concRest
       altResultVar <- newEmptyMVar
+      debugThread "evalFlatInIO_Alt: BEFORE evalFlatInIO on children"
       Tuple ioActions threadIds0 <- unzipTuple <$> traverse (evalFlatInIO unmask altResultVar resultCountVar . FlatApp) concList
+      debugThread "evalFlatInIO_Alt: AFTER evalFlatInIO on children"
       let
         threadIds = dlistConcatAll threadIds0
+        -- evalAction :: Async (Either SomeException a)
         evalAction = do
-          debugThread "evalFlatInIO_Alt: before eval ioActions"
+          debugThread "evalFlatInIO_Alt: CALL evalAction"
+          debugThread "evalFlatInIO_Alt: BEFORE eval ioActions"
           for_ ioActions $ \action -> do
-            debugThread "evalFlatInIO_Alt: evaluation IO statement"
+            debugThread "evalFlatInIO_Alt: CALL alt child eval action"
             void action
-          debugThread "evalFlatInIO_Alt: after eval ioActions"
-          debugThread "evalFlatInIO_Alt: before read altResultVar"
+          debugThread "evalFlatInIO_Alt: AFTER eval ioActions"
+          debugThread "evalFlatInIO_Alt: BEFORE read altResultVar"
           !result <- unmask $ readMVar altResultVar
-          debugThread "evalFlatInIO_Alt: after read altResultVar"
-          mapM_ C.killThread (dlistToList threadIds)
-          debugThread "evalFlatInIO_Alt: before kill all threads"
+          debugThread "evalFlatInIO_Alt: AFTER read altResultVar"
+          debugThread "evalFlatInIO_Alt: BEFORE kill child threads"
+          for_ (dlistToList threadIds) $ \tid -> do
+            debugThread $ "evalFlatInIO_Alt: KILL " <> show tid
+            C.killThread tid
           unmask $ putMVar resultVar result
-          debugThread "evalFlatInIO_Alt: after kill all threads"
+          debugThread "evalFlatInIO_Alt: AFTER kill all threads"
           pure result
+
       pure (Tuple evalAction threadIds)
 
 
@@ -987,7 +1002,9 @@ runFlat f0 = E.uninterruptibleMask $ \restore -> do
   --
   -- TODO: Investigate why performance degradation on Either
   resultVar <- newEmptyMVar
+  debugThread "runFlat: BEFORE evalFlatInIO"
   (Tuple getRes tids0) <- {-# SCC go_Call #-} evalFlatInIO restore resultVar resultCountVar f0
+  debugThread "runFlat: AFTER evalFlatInIO"
 
   let tids = dlistToList tids0
       tidCount = length tids
@@ -1003,25 +1020,25 @@ runFlat f0 = E.uninterruptibleMask $ \restore -> do
 
   -- Restore the original masking state while blocking and catch
   -- exceptions to allow the parent thread to be killed early.
-  debugThread "runFlat: before getRes"
+  debugThread "runFlat: BEFORE getRes"
   res <- E.try $ restore getRes
-  debugThread "runFlat: after getRes"
+  debugThread "runFlat: AFTER getRes"
 
   count0 <- atomically $ readTVar resultCountVar
-  debugThread $ "runFlat: getting thread count: " <> show count0
+  debugThread $ "runFlat: READ thread count: " <> show count0
   unless (allDone count0) $ do
     -- Kill all of the threads
     -- NOTE: Replacing A.AsyncCancelled with KillThread as the
     -- 'A.AsyncCancelled' constructor is not exported in older versions
     -- of the async package
     -- for_ tids $ \tid -> E.throwTo tid A.AsyncCancelled
-    debugThread $ "runFlat: before killing all threads"
+    debugThread $ "runFlat: BEFORE killing all threads"
     for_ tids $ \tid -> do
-      debugThread $ "runFlat: killing thread id "  <> show tid
+      debugThread $ "runFlat: BEFORE KILL "  <> show tid
       C.throwTo tid E.ThreadKilled
       -- C.killThread tid
-      debugThread $ "runFlat: killed thread id "  <> show tid
-    debugThread $ "runFlat: after killing all threads"
+      debugThread $ "runFlat: AFTER KILL "  <> show tid
+    debugThread $ "runFlat: AFTER killing all threads"
 
 
     -- Wait for all of the threads to die. We're going to restore the original
@@ -1029,13 +1046,13 @@ runFlat f0 = E.uninterruptibleMask $ \restore -> do
     -- child thread, so that we can be killed by an async exception. We decided
     -- this is a better behavior than hanging indefinitely and wait for a SIGKILL.
 
-    debugThread $ "DEBUG: before waiting for allDone"
+    debugThread $ "runFlat: BEFORE waiting for allDone"
     {-# SCC runFlat_waitAllDone #-} restore $ atomically $ do
       count <- readTVar resultCountVar
       -- traceM $ ">>> DEBUG Count is: " <> show count
       -- retries until resultCountVar has increased to the threadId count returned by go
       check $ allDone count
-    debugThread $ "DEBUG: after waiting for allDone"
+    debugThread $ "runFlat: AFTER waiting for allDone"
 
   -- Return the result or throw an exception. Yes, we could use
   -- either or join, but explicit pattern matching is nicer here.
